@@ -17,14 +17,29 @@ final class DirectoryModel: ObservableObject {
     @Published var showHidden = false
     @Published var sortKey: SortKey = .name
     @Published var sortAsc = true
-    @Published var filter: String = ""
+    @Published var filter: String = "" {
+        didSet {
+            guard filter != oldValue else { return }
+            filtering = !filter.isEmpty
+            clampSelection()
+            updateStatus()
+        }
+    }
     @Published var filtering = false
     @Published private(set) var status: String = ""
+    /// True while showing the Spotlight-backed "Recents" listing instead of `url`'s contents.
+    @Published private(set) var isRecents = false
 
     private var backStack: [URL] = []
     private var forwardStack: [URL] = []
     /// Remember the selected name per directory so going back restores the cursor.
     private var lastSelectedName: [URL: String] = [:]
+
+    /// How far back "Recents" looks, in days.
+    static let recentsWindowDays = 30
+
+    private var recentsQuery: NSMetadataQuery?
+    private var recentsObserver: NSObjectProtocol?
 
     init(start: URL) {
         self.url = start
@@ -45,6 +60,8 @@ final class DirectoryModel: ObservableObject {
     }
 
     var pathComponents: [(name: String, url: URL)] {
+        // In Recents we show a single synthetic crumb; clicking it returns to `url`.
+        if isRecents { return [("Recents", url)] }
         var result: [(String, URL)] = []
         var u = url.standardizedFileURL
         // Cap iterations as a safety net — deletingLastPathComponent() on "/"
@@ -64,6 +81,7 @@ final class DirectoryModel: ObservableObject {
     // MARK: Loading
 
     func load() {
+        if isRecents { loadRecents(); return }
         let fm = FileManager.default
         let keys: [URLResourceKey] = [
             .isDirectoryKey, .fileSizeKey, .totalFileAllocatedSizeKey,
@@ -108,6 +126,98 @@ final class DirectoryModel: ObservableObject {
         }
     }
 
+    // MARK: Recents
+
+    /// Enter the Spotlight-backed Recents view (recently created files in the home folder).
+    func showRecents() {
+        guard !isRecents else { refresh(); return }
+        if let cur = selectedItem { lastSelectedName[url] = cur.name }
+        backStack.append(url)          // goBack returns to the folder we left
+        forwardStack.removeAll()
+        isRecents = true
+        filter = ""; filtering = false
+        selection = 0
+        loadRecents()
+    }
+
+    /// Leave Recents and show the contents of `url` again.
+    private func exitRecents() {
+        teardownRecentsQuery()
+        isRecents = false
+        load()
+        restoreSelection(preferName: lastSelectedName[url])
+    }
+
+    private func loadRecents() {
+        items = []
+        status = "Finding recent files…"
+        teardownRecentsQuery()
+
+        // Mirror Finder's "Recents": query by LAST-USED date (the file was actually
+        // opened), not creation date. This is both far more relevant (only files you
+        // touched) and far faster (a much smaller indexed set than "everything
+        // created"). We let Spotlight do the sorting so we never sort a huge array.
+        let q = NSMetadataQuery()
+        q.searchScopes = [NSMetadataQueryUserHomeScope]
+        let cutoff = Date().addingTimeInterval(-Double(Self.recentsWindowDays) * 86_400)
+        q.predicate = NSPredicate(format: "%K >= %@", NSMetadataItemLastUsedDateKey, cutoff as NSDate)
+        q.sortDescriptors = [NSSortDescriptor(key: NSMetadataItemLastUsedDateKey, ascending: false)]
+        // Only fetch the attributes we read — keeps result objects lightweight.
+        q.valueListAttributes = [NSMetadataItemLastUsedDateKey, NSMetadataItemPathKey]
+        recentsObserver = NotificationCenter.default.addObserver(
+            forName: .NSMetadataQueryDidFinishGathering, object: q, queue: .main
+        ) { [weak self] _ in
+            // queue: .main guarantees main-thread delivery, so this hop is safe.
+            MainActor.assumeIsolated { self?.recentsGatheringFinished() }
+        }
+        recentsQuery = q
+        q.start()
+    }
+
+    private func recentsGatheringFinished() {
+        guard isRecents, let q = recentsQuery else { return }
+        q.disableUpdates()
+        // Results already arrive sorted by last-used date (newest first) from Spotlight.
+        // Walk them in order, drop noise, build rows, and stop at the cap — so we only
+        // ever construct ~250 FileItems regardless of how big the index is.
+        let libraryPrefix = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library").standardizedFileURL.path + "/"
+
+        var rows: [FileItem] = []
+        rows.reserveCapacity(250)
+        for i in 0..<q.resultCount {
+            guard let item = q.result(at: i) as? NSMetadataItem,
+                  let path = item.value(forAttribute: NSMetadataItemPathKey) as? String
+            else { continue }
+            if path.hasPrefix(libraryPrefix) { continue }   // ~/Library noise
+            if path.contains("/.") { continue }             // hidden files & dot-dirs (.git, .Trash…)
+            let fi = FileItem(url: URL(fileURLWithPath: path))
+            if fi.isDir { continue }
+            rows.append(fi)
+            if rows.count >= 250 { break }
+        }
+        teardownRecentsQuery()   // one-shot gather, not live updates
+
+        items = rows
+        clampSelection()
+        updateStatus()
+    }
+
+    private func teardownRecentsQuery() {
+        if let o = recentsObserver { NotificationCenter.default.removeObserver(o) }
+        recentsObserver = nil
+        recentsQuery?.stop()
+        recentsQuery = nil
+    }
+
+    /// Jump from a Recents entry to the folder that contains it, cursor on the file.
+    func openEnclosingFolder() {
+        guard let item = selectedItem else { return }
+        let name = item.name
+        navigate(to: item.url.deletingLastPathComponent())
+        if let idx = visibleItems.firstIndex(where: { $0.name == name }) { selection = idx }
+    }
+
     // MARK: Navigation
 
     func navigate(to dest: URL, recordBack: Bool = true, remember: URL? = nil) {
@@ -120,6 +230,8 @@ final class DirectoryModel: ObservableObject {
             backStack.append(url)
             forwardStack.removeAll()
         }
+        teardownRecentsQuery()
+        isRecents = false
         url = dest.standardizedFileURL
         filter = ""; filtering = false
         load()
@@ -144,6 +256,7 @@ final class DirectoryModel: ObservableObject {
     }
 
     func goUp() {
+        if isRecents { exitRecents(); return }
         let parent = url.deletingLastPathComponent()
         guard parent.path != url.path else { return }
         let cameFrom = url.lastPathComponent
@@ -236,25 +349,12 @@ final class DirectoryModel: ObservableObject {
 
     // MARK: Filter
 
-    func appendToFilter(_ s: String) {
-        filtering = true
-        filter += s
-        clampSelection()
-        updateStatus()
-    }
+    // filter's didSet keeps filtering/selection/status in sync, so these stay thin.
+    func appendToFilter(_ s: String) { filter += s }
 
-    func backspaceFilter() {
-        if !filter.isEmpty { filter.removeLast() }
-        if filter.isEmpty { filtering = false }
-        clampSelection()
-        updateStatus()
-    }
+    func backspaceFilter() { if !filter.isEmpty { filter.removeLast() } }
 
-    func clearFilter() {
-        filter = ""; filtering = false
-        clampSelection()
-        updateStatus()
-    }
+    func clearFilter() { filter = "" }
 
     // MARK: File operations
 
@@ -319,6 +419,105 @@ final class DirectoryModel: ObservableObject {
         status = "Copied path"
     }
 
+    // MARK: Clipboard (file copy / paste)
+
+    /// Put the selected file on the general pasteboard as a file URL so it can be
+    /// pasted into Finder, Solo, or dropped into other apps.
+    func copySelectedToClipboard() {
+        guard let item = selectedItem else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.writeObjects([item.url as NSURL])
+        status = "Copied “\(item.name)” — ⌘V to paste"
+    }
+
+    /// Copy any file URLs on the pasteboard into the current directory.
+    func pasteIntoCurrent() {
+        let urls = (NSPasteboard.general.readObjects(forClasses: [NSURL.self]) as? [URL]) ?? []
+        let files = urls.filter { $0.isFileURL }
+        guard !files.isEmpty else { status = "Clipboard has no files"; return }
+        var copied = 0
+        var lastName: String?
+        for src in files {
+            let dest = uniqueDestination(forName: src.lastPathComponent, in: url)
+            do {
+                try FileManager.default.copyItem(at: src, to: dest)
+                copied += 1; lastName = dest.lastPathComponent
+            } catch {
+                status = "Paste failed: \(error.localizedDescription)"
+            }
+        }
+        guard copied > 0 else { return }
+        refresh()
+        if let n = lastName, let idx = visibleItems.firstIndex(where: { $0.name == n }) { selection = idx }
+        status = copied == 1 ? "Pasted “\(lastName ?? "")”" : "Pasted \(copied) items"
+    }
+
+    // MARK: Drag & drop
+
+    /// Receive files dropped onto a destination directory (a folder row, or the
+    /// current directory). Move within the same volume, copy across volumes.
+    @discardableResult
+    func receiveDrop(urls: [URL], into dest: URL) -> Bool {
+        let files = urls.filter { $0.isFileURL }
+        guard !files.isEmpty else { return false }
+        let fm = FileManager.default
+        let destStd = dest.standardizedFileURL
+        var changed = 0
+        var lastName: String?
+        for src in files {
+            let srcStd = src.standardizedFileURL
+            // No-op: dropping into the folder it already lives in.
+            if srcStd.deletingLastPathComponent() == destStd { continue }
+            // Guard: can't move a folder into itself or a descendant.
+            if destStd.path == srcStd.path || destStd.path.hasPrefix(srcStd.path + "/") { continue }
+            let target = uniqueDestination(forName: src.lastPathComponent, in: dest)
+            do {
+                if sameVolume(srcStd, destStd) {
+                    try fm.moveItem(at: src, to: target)
+                } else {
+                    try fm.copyItem(at: src, to: target)
+                }
+                changed += 1; lastName = target.lastPathComponent
+            } catch {
+                status = "Drop failed: \(error.localizedDescription)"
+            }
+        }
+        guard changed > 0 else { return false }
+        refresh()
+        if destStd == url.standardizedFileURL, let n = lastName,
+           let idx = visibleItems.firstIndex(where: { $0.name == n }) { selection = idx }
+        status = "Moved \(changed) item\(changed == 1 ? "" : "s")"
+        return true
+    }
+
+    private func sameVolume(_ a: URL, _ b: URL) -> Bool {
+        let va = (try? a.resourceValues(forKeys: [.volumeIdentifierKey]))?.volumeIdentifier
+        let vb = (try? b.resourceValues(forKeys: [.volumeIdentifierKey]))?.volumeIdentifier
+        if let va = va as? NSObject, let vb = vb as? NSObject { return va.isEqual(vb) }
+        return false
+    }
+
+    /// A non-colliding destination URL in `dir` for an item named `name`,
+    /// appending " copy" / " copy N" as needed.
+    private func uniqueDestination(forName name: String, in dir: URL) -> URL {
+        let fm = FileManager.default
+        let ns = name as NSString
+        let base = ns.deletingPathExtension
+        let ext = ns.pathExtension
+        func compose(_ stem: String) -> URL {
+            let u = dir.appendingPathComponent(stem)
+            return ext.isEmpty ? u : u.appendingPathExtension(ext)
+        }
+        var candidate = dir.appendingPathComponent(name)
+        if !fm.fileExists(atPath: candidate.path) { return candidate }
+        candidate = compose("\(base) copy")
+        var i = 2
+        while fm.fileExists(atPath: candidate.path) {
+            candidate = compose("\(base) copy \(i)"); i += 1
+        }
+        return candidate
+    }
+
     func goToPathPrompt() {
         guard let path = Prompt.text(title: "Go to Folder", message: "Path:", defaultValue: url.path) else { return }
         let expanded = (path as NSString).expandingTildeInPath
@@ -333,6 +532,8 @@ final class DirectoryModel: ObservableObject {
         var s = ""
         if !filter.isEmpty {
             s = "Filter “\(filter)” — \(shown)/\(total)"
+        } else if isRecents {
+            s = "Recents · \(total) file\(total == 1 ? "" : "s") · last \(Self.recentsWindowDays) days"
         } else {
             let dirs = items.filter(\.isDir).count
             s = "\(total) items · \(dirs) folders · \(total - dirs) files"

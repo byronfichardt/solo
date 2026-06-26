@@ -10,6 +10,7 @@ struct FileItem: Identifiable, Hashable {
     let isPackage: Bool
     let size: Int64          // -1 for directories we didn't measure
     let modified: Date
+    let created: Date
 
     var id: URL { url }
 
@@ -21,8 +22,8 @@ struct FileItem: Identifiable, Hashable {
         self.url = url
         let keys: Set<URLResourceKey> = [
             .isDirectoryKey, .fileSizeKey, .totalFileAllocatedSizeKey,
-            .contentModificationDateKey, .isSymbolicLinkKey, .isPackageKey,
-            .localizedNameKey
+            .contentModificationDateKey, .creationDateKey, .isSymbolicLinkKey,
+            .isPackageKey, .localizedNameKey
         ]
         let v = try? url.resourceValues(forKeys: keys)
         self.name = v?.localizedName ?? url.lastPathComponent
@@ -33,6 +34,7 @@ struct FileItem: Identifiable, Hashable {
         self.isDir = dir
         self.size = dir ? -1 : Int64(v?.fileSize ?? v?.totalFileAllocatedSize ?? 0)
         self.modified = v?.contentModificationDate ?? .distantPast
+        self.created = v?.creationDate ?? (v?.contentModificationDate ?? .distantPast)
     }
 
     /// Cached system icon for the file.

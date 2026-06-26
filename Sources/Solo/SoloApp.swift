@@ -14,16 +14,19 @@ func resolveStartDirectory() -> URL {
     return FileManager.default.homeDirectoryForCurrentUser
 }
 
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var window: NSWindow!
     private var model: DirectoryModel!
+    private weak var showHiddenMenuItem: NSMenuItem?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
-        setupMenu()
 
         let dirModel = DirectoryModel(start: resolveStartDirectory())
         model = dirModel
+        setupMenu()
+
         let root = ContentView(model: dirModel)
 
         window = NSWindow(
@@ -65,6 +68,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         appMenu.addItem(withTitle: "Quit Solo", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appMenuItem.submenu = appMenu
 
+        // View menu
+        // ⌘. is the macOS system "Cancel" shortcut, so SwiftUI's .onKeyPress never
+        // receives it. Binding it as a menu key-equivalent dispatches via
+        // performKeyEquivalent: instead, which fires reliably.
+        let viewMenuItem = NSMenuItem()
+        mainMenu.addItem(viewMenuItem)
+        let viewMenu = NSMenu(title: "View")
+        let hiddenItem = NSMenuItem(title: "Show Hidden Files", action: #selector(toggleHiddenFiles(_:)), keyEquivalent: ".")
+        hiddenItem.target = self
+        hiddenItem.state = model.showHidden ? .on : .off
+        viewMenu.addItem(hiddenItem)
+        showHiddenMenuItem = hiddenItem
+        viewMenuItem.submenu = viewMenu
+
         // Window menu
         let windowMenuItem = NSMenuItem()
         mainMenu.addItem(windowMenuItem)
@@ -74,6 +91,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         windowMenuItem.submenu = windowMenu
 
         NSApp.mainMenu = mainMenu
+    }
+
+    @objc private func toggleHiddenFiles(_ sender: NSMenuItem) {
+        model.toggleHidden()
+        sender.state = model.showHidden ? .on : .off
     }
 }
 

@@ -1,16 +1,20 @@
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 
 struct ContentView: View {
     @StateObject var model: DirectoryModel
     @FocusState private var focused: Bool
+    @FocusState private var searchFocused: Bool
     @State private var showHelp = false
+    @State private var dropTargetIndex: Int?
+    @State private var listDropTargeted = false
 
     private let pageSize = 15
 
     var body: some View {
         VStack(spacing: 0) {
-            PathBar(model: model)
+            PathBar(model: model, searchFocused: $searchFocused, focusList: { focused = true })
             Divider()
             ColumnHeader(model: model)
             Divider()
@@ -39,7 +43,8 @@ struct ContentView: View {
                     }
                     ForEach(Array(model.visibleItems.enumerated()), id: \.element.id) { idx, item in
                         FileRow(item: item, selected: idx == model.selection && focused,
-                                softSelected: idx == model.selection && !focused)
+                                softSelected: idx == model.selection && !focused,
+                                dropTargeted: item.isDir && dropTargetIndex == idx)
                             .contentShape(Rectangle())
                             // Select on the first click immediately; double-click opens.
                             // simultaneousGesture avoids the tap-disambiguation delay that
@@ -52,6 +57,19 @@ struct ContentView: View {
                                     model.selection = idx; model.openSelected()
                                 }
                             )
+                            // Drag a file out (to another folder, Finder, or Claude).
+                            .onDrag { NSItemProvider(object: item.url as NSURL) }
+                            // Folders accept drops (move/copy the dropped files in).
+                            .modifier(FolderDropModifier(
+                                enabled: item.isDir,
+                                isTargeted: Binding(
+                                    get: { dropTargetIndex == idx },
+                                    set: { dropTargetIndex = $0 ? idx : nil }),
+                                onDrop: { providers in
+                                    loadURLs(from: providers) { model.receiveDrop(urls: $0, into: item.url) }
+                                    return true
+                                }))
+                            .contextMenu { rowMenu(idx: idx, item: item) }
                     }
                 }
             }
@@ -64,7 +82,56 @@ struct ContentView: View {
             .onChange(of: model.url) { _, _ in
                 proxy.scrollTo(model.selectedItem?.id)
             }
+            // Drop onto empty pane area → into the current directory.
+            .onDrop(of: [.fileURL], isTargeted: $listDropTargeted) { providers in
+                loadURLs(from: providers) { model.receiveDrop(urls: $0, into: model.url) }
+                return true
+            }
+            .overlay {
+                if listDropTargeted {
+                    RoundedRectangle(cornerRadius: 6)
+                        .strokeBorder(Color.accentColor, lineWidth: 2)
+                        .padding(2)
+                        .allowsHitTesting(false)
+                }
+            }
         }
+    }
+
+    @ViewBuilder
+    private func rowMenu(idx: Int, item: FileItem) -> some View {
+        Button(item.isDir ? "Open Folder" : "Open") { model.selection = idx; model.openSelected() }
+        if model.isRecents {
+            Button("Open Enclosing Folder") { model.selection = idx; model.openEnclosingFolder() }
+        }
+        Divider()
+        Button("Copy") { model.selection = idx; model.copySelectedToClipboard() }
+        Button("Paste") { model.pasteIntoCurrent() }
+        Button("Copy Path") { model.selection = idx; model.copyPathToPasteboard() }
+        Divider()
+        Button("Rename…") { model.selection = idx; model.renameSelected() }
+        Button("Move to Trash") { model.selection = idx; model.trashSelected() }
+        Divider()
+        Button("Reveal in Finder") { model.selection = idx; model.revealInFinder() }
+        Button("New Folder…") { model.newFolder() }
+    }
+
+    /// Asynchronously resolve file URLs from dropped item providers, then run `completion` on the main actor.
+    private func loadURLs(from providers: [NSItemProvider], completion: @escaping ([URL]) -> Void) {
+        var urls: [URL] = []
+        let lock = NSLock()
+        let group = DispatchGroup()
+        for p in providers {
+            group.enter()
+            _ = p.loadObject(ofClass: NSURL.self) { reading, _ in
+                if let nsurl = reading as? NSURL {
+                    let u = nsurl as URL
+                    if u.isFileURL { lock.lock(); urls.append(u); lock.unlock() }
+                }
+                group.leave()
+            }
+        }
+        group.notify(queue: .main) { completion(urls) }
     }
 
     // MARK: Keyboard
@@ -120,17 +187,20 @@ struct ContentView: View {
         case .return:     model.renameSelected(); return .handled
         default: break
         }
+        let option = p.modifiers.contains(.option)
         switch p.key.character {
         case "r": model.refresh()
         case "n": model.newFolder()
         case ".": model.toggleHidden()
-        case "c": model.copyPathToPasteboard()
+        case "c": option ? model.copyPathToPasteboard() : model.copySelectedToClipboard()
+        case "v": model.pasteIntoCurrent()
         case "l": model.goToPathPrompt()
         case "t": model.openTerminalHere()
-        case "f": model.revealInFinder()
+        case "f": shift ? model.revealInFinder() : (searchFocused = true)
         case "[": model.goBack()
         case "]": model.goForward()
         case "h": model.goHome()
+        case "0": model.showRecents()
         case "s": shift ? model.toggleSortDirection() : model.cycleSort()
         case "1": model.setSort(.name)
         case "2": model.setSort(.size)
@@ -147,25 +217,76 @@ struct ContentView: View {
 
 struct PathBar: View {
     @ObservedObject var model: DirectoryModel
+    @FocusState.Binding var searchFocused: Bool
+    var focusList: () -> Void
 
     var body: some View {
-        HStack(spacing: 2) {
-            ForEach(Array(model.pathComponents.enumerated()), id: \.offset) { idx, comp in
-                if idx > 0 {
-                    Text("›").foregroundStyle(.tertiary).font(.system(size: 11))
-                }
-                Button(comp.name) {
-                    model.navigate(to: comp.url)
-                }
-                .buttonStyle(.plain)
-                .font(.system(size: 12, weight: idx == model.pathComponents.count - 1 ? .semibold : .regular))
-                .foregroundStyle(idx == model.pathComponents.count - 1 ? Color.primary : Color.secondary)
+        HStack(spacing: 8) {
+            Button {
+                model.showRecents(); focusList()
+            } label: {
+                Image(systemName: "clock")
+                    .font(.system(size: 12))
+                    .foregroundStyle(model.isRecents ? Color.accentColor : .secondary)
             }
-            Spacer()
+            .buttonStyle(.plain)
+            .help("Recent files (⌘0)")
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 2) {
+                    ForEach(Array(model.pathComponents.enumerated()), id: \.offset) { idx, comp in
+                        if idx > 0 {
+                            Text("›").foregroundStyle(.tertiary).font(.system(size: 11))
+                        }
+                        Button(comp.name) {
+                            model.navigate(to: comp.url)
+                        }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 12, weight: idx == model.pathComponents.count - 1 ? .semibold : .regular))
+                        .foregroundStyle(idx == model.pathComponents.count - 1 ? Color.primary : Color.secondary)
+                    }
+                }
+            }
+            Spacer(minLength: 8)
+            searchField
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
         .background(Color(nsColor: .windowBackgroundColor))
+    }
+
+    private var searchField: some View {
+        HStack(spacing: 5) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+            TextField("Search", text: $model.filter)
+                .textFieldStyle(.plain)
+                .font(.system(size: 12))
+                .frame(width: 140)
+                .focused($searchFocused)
+                .onSubmit { model.selectFirst(); focusList() }
+                .onExitCommand { model.clearFilter(); focusList() }
+            if !model.filter.isEmpty {
+                Button {
+                    model.clearFilter(); focusList()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 4)
+        .background(
+            Capsule().fill(Color(nsColor: .textBackgroundColor).opacity(0.7))
+        )
+        .overlay(
+            Capsule().strokeBorder(
+                searchFocused ? Color.accentColor : Color.secondary.opacity(0.25),
+                lineWidth: 1)
+        )
     }
 }
 
@@ -208,10 +329,26 @@ struct ColumnHeader: View {
 
 // MARK: - File row
 
+/// Applies a folder drop target only when `enabled` (file rows aren't drop targets).
+struct FolderDropModifier: ViewModifier {
+    let enabled: Bool
+    @Binding var isTargeted: Bool
+    let onDrop: ([NSItemProvider]) -> Bool
+
+    func body(content: Content) -> some View {
+        if enabled {
+            content.onDrop(of: [.fileURL], isTargeted: $isTargeted, perform: onDrop)
+        } else {
+            content
+        }
+    }
+}
+
 struct FileRow: View {
     let item: FileItem
     let selected: Bool
     let softSelected: Bool
+    var dropTargeted: Bool = false
     @State private var hovering = false
 
     var body: some View {
@@ -238,12 +375,20 @@ struct FileRow: View {
         .padding(.horizontal, 10)
         .padding(.vertical, 3)
         .background(background)
+        .overlay {
+            if dropTargeted {
+                RoundedRectangle(cornerRadius: 5)
+                    .strokeBorder(Color.accentColor, lineWidth: 2)
+            }
+        }
         .onHover { hovering = $0 }
     }
 
     private var background: some View {
         Group {
-            if selected {
+            if dropTargeted {
+                Color.accentColor.opacity(0.18)
+            } else if selected {
                 Color.accentColor
             } else if softSelected {
                 Color.accentColor.opacity(0.25)
@@ -305,18 +450,23 @@ struct HelpOverlay: View {
         ("PageUp / PageDown", "Page through list"),
         ("⌘← / ⌘→", "Back / Forward history"),
         ("⌘↑ / ⌘↓", "Parent folder / Open"),
+        ("⌘C / ⌘V", "Copy file / Paste into folder"),
+        ("⌘⌥C", "Copy path"),
+        ("drag", "Move to a folder, or drag out to other apps"),
+        ("⌘F", "Search (click the field too)"),
         ("⌘R", "Refresh"),
         ("⌘N", "New folder"),
         ("⌘Return", "Rename selected"),
         ("⌘Delete", "Move to Trash"),
         ("⌘.", "Toggle hidden files"),
-        ("⌘C", "Copy path"),
         ("⌘L", "Go to path…"),
-        ("⌘F", "Reveal in Finder"),
+        ("⌘0", "Recent files (newest first)"),
+        ("⌘⇧F", "Reveal in Finder"),
         ("⌘T", "Open Terminal here"),
         ("⌘H", "Home folder"),
         ("⌘S / ⌘⇧S", "Cycle sort / Flip direction"),
         ("⌘1…4", "Sort by Name / Size / Date / Type"),
+        ("right-click", "Context menu of actions"),
     ]
 
     var body: some View {

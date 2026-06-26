@@ -7,7 +7,7 @@
     <key>CFBundleDisplayName</key>
     <string>Solo</string>
     <key>CFBundleIdentifier</key>
-    <string>dk.hobbii.solo</string>
+    <string>com.byronfichardt.solo</string>
     <key>CFBundleExecutable</key>
     <string>Solo</string>
     <key>CFBundleIconFile</key>
