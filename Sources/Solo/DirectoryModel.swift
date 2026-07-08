@@ -13,7 +13,13 @@ enum SortKey: String, CaseIterable {
 final class DirectoryModel: ObservableObject {
     @Published private(set) var url: URL
     @Published private(set) var items: [FileItem] = []
+    /// The keyboard cursor / range anchor — always a valid index into `visibleItems`.
     @Published var selection: Int = 0
+    /// Extra multi-selected rows, keyed by URL so the set survives re-sorting and refresh.
+    /// Empty means "plain single selection" and everything falls back to the cursor.
+    @Published var markedURLs: Set<URL> = []
+    /// Where a shift-range selection is measured from. nil ⇒ use the cursor.
+    private var anchorIndex: Int?
     @Published var showHidden = false
     @Published var sortKey: SortKey = .name
     @Published var sortAsc = true
@@ -22,6 +28,8 @@ final class DirectoryModel: ObservableObject {
             guard filter != oldValue else { return }
             filtering = !filter.isEmpty
             clampSelection()
+            pruneMarks()
+            anchorIndex = selection
             updateStatus()
         }
     }
@@ -59,6 +67,23 @@ final class DirectoryModel: ObservableObject {
         return v[selection]
     }
 
+    /// Items an action applies to: the marked set if any, otherwise just the cursor item.
+    var selectedItems: [FileItem] {
+        if markedURLs.isEmpty { return selectedItem.map { [$0] } ?? [] }
+        return visibleItems.filter { markedURLs.contains($0.url) }
+    }
+
+    /// How many rows are effectively selected (1 for a plain cursor selection).
+    var selectionCount: Int {
+        markedURLs.isEmpty ? (selectedItem == nil ? 0 : 1) : markedURLs.count
+    }
+
+    /// Whether the row at `idx` is part of the effective selection (for row highlighting).
+    func isSelected(_ idx: Int) -> Bool {
+        guard visibleItems.indices.contains(idx) else { return false }
+        return markedURLs.isEmpty ? idx == selection : markedURLs.contains(visibleItems[idx].url)
+    }
+
     var pathComponents: [(name: String, url: URL)] {
         // In Recents we show a single synthetic crumb; clicking it returns to `url`.
         if isRecents { return [("Recents", url)] }
@@ -94,6 +119,7 @@ final class DirectoryModel: ObservableObject {
             let contents = try fm.contentsOfDirectory(at: url, includingPropertiesForKeys: keys, options: opts)
             items = contents.map(FileItem.init).sorted(by: comparator)
             clampSelection()
+            pruneMarks()
             updateStatus()
         } catch {
             items = []
@@ -239,6 +265,8 @@ final class DirectoryModel: ObservableObject {
     }
 
     private func restoreSelection(preferName: String?) {
+        // Entering a new directory always starts from a clean single selection.
+        defer { collapseToCursor() }
         guard let name = preferName,
               let idx = visibleItems.firstIndex(where: { $0.name == name }) else {
             selection = 0; return
@@ -247,6 +275,12 @@ final class DirectoryModel: ObservableObject {
     }
 
     func openSelected() {
+        // With several items marked, open every file (folders are skipped — a single
+        // pane can't descend into more than one). Single selection keeps folder navigation.
+        if selectionCount > 1 {
+            for item in selectedItems where !item.isDir { NSWorkspace.shared.open(item.url) }
+            return
+        }
         guard let item = selectedItem else { return }
         if item.isDir {
             navigate(to: item.url)
@@ -287,15 +321,101 @@ final class DirectoryModel: ObservableObject {
         let count = visibleItems.count
         guard count > 0 else { selection = 0; return }
         selection = min(max(0, selection + delta), count - 1)
+        collapseToCursor()
         updateStatus()
     }
 
-    func selectFirst() { selection = 0; updateStatus() }
-    func selectLast() { selection = max(0, visibleItems.count - 1); updateStatus() }
+    func selectFirst() { selection = 0; collapseToCursor(); updateStatus() }
+    func selectLast() { selection = max(0, visibleItems.count - 1); collapseToCursor(); updateStatus() }
 
     private func clampSelection() {
         let count = visibleItems.count
         selection = count == 0 ? 0 : min(selection, count - 1)
+    }
+
+    // MARK: Multi-selection
+
+    /// Drop any multi-selection and anchor on the current cursor row.
+    private func collapseToCursor() {
+        markedURLs = []
+        anchorIndex = selection
+    }
+
+    /// Prune marks to URLs that still exist in the current listing (after sort/refresh).
+    private func pruneMarks() {
+        guard !markedURLs.isEmpty else { return }
+        markedURLs.formIntersection(visibleItems.map(\.url))
+    }
+
+    /// Plain click / arrow: select exactly this row.
+    func selectSingle(_ idx: Int) {
+        guard visibleItems.indices.contains(idx) else { return }
+        selection = idx
+        collapseToCursor()
+        updateStatus()
+    }
+
+    /// ⌘-click: toggle this row's membership, keeping the rest of the selection.
+    func toggleMark(_ idx: Int) {
+        guard visibleItems.indices.contains(idx) else { return }
+        // First ⌘-click seeds the set with the existing cursor so it isn't lost.
+        if markedURLs.isEmpty, let cur = selectedItem { markedURLs = [cur.url] }
+        let target = visibleItems[idx].url
+        if markedURLs.contains(target) { markedURLs.remove(target) } else { markedURLs.insert(target) }
+        // Collapse back to a plain selection when a single row remains, moving the
+        // cursor onto whatever that row is (it may not be the one just clicked).
+        if markedURLs.count == 1, let only = markedURLs.first,
+           let onlyIdx = visibleItems.firstIndex(where: { $0.url == only }) {
+            selection = onlyIdx
+            anchorIndex = onlyIdx
+            markedURLs = []
+        } else {
+            selection = idx
+            anchorIndex = idx
+        }
+        updateStatus()
+    }
+
+    /// ⇧-click: select the contiguous range between the anchor and this row.
+    func extendTo(_ idx: Int) {
+        guard visibleItems.indices.contains(idx) else { return }
+        let a = anchorIndex ?? selection
+        anchorIndex = a
+        let lo = min(a, idx), hi = max(a, idx)
+        markedURLs = Set(visibleItems[lo...hi].map(\.url))
+        selection = idx
+        if markedURLs.count == 1 { markedURLs = [] }   // single-row range ⇒ plain selection
+        updateStatus()
+    }
+
+    /// ⇧↑ / ⇧↓: move the cursor and grow/shrink the range from the anchor.
+    func extendSelection(by delta: Int) {
+        let count = visibleItems.count
+        guard count > 0 else { return }
+        let a = anchorIndex ?? selection
+        anchorIndex = a
+        let newCursor = min(max(0, selection + delta), count - 1)
+        let lo = min(a, newCursor), hi = max(a, newCursor)
+        markedURLs = Set(visibleItems[lo...hi].map(\.url))
+        selection = newCursor
+        if markedURLs.count == 1 { markedURLs = [] }
+        updateStatus()
+    }
+
+    /// ⌘A: select everything currently visible.
+    func selectAll() {
+        guard !visibleItems.isEmpty else { return }
+        markedURLs = Set(visibleItems.map(\.url))
+        anchorIndex = selection
+        updateStatus()
+    }
+
+    /// When a context-menu action fires on `idx`: if that row isn't already part of a
+    /// multi-selection, collapse to just it first (matches Finder).
+    func contextSelect(_ idx: Int) {
+        guard visibleItems.indices.contains(idx) else { return }
+        if !markedURLs.isEmpty && markedURLs.contains(visibleItems[idx].url) { return }
+        selectSingle(idx)
     }
 
     // MARK: Options
@@ -336,6 +456,8 @@ final class DirectoryModel: ObservableObject {
         if let n = keepName, let idx = visibleItems.firstIndex(where: { $0.name == n }) {
             selection = idx
         }
+        // Marks are URL-keyed so they survive the reorder; the index anchor doesn't.
+        anchorIndex = selection
     }
 
     func refresh() {
@@ -359,19 +481,32 @@ final class DirectoryModel: ObservableObject {
     // MARK: File operations
 
     func trashSelected() {
-        guard let item = selectedItem else { return }
+        let targets = selectedItems
+        guard !targets.isEmpty else { return }
         let idx = selection
-        do {
-            try FileManager.default.trashItem(at: item.url, resultingItemURL: nil)
-            refresh()
-            selection = min(idx, max(0, visibleItems.count - 1))
-            status = "Moved “\(item.name)” to Trash"
-        } catch {
-            status = "Trash failed: \(error.localizedDescription)"
+        var trashed = 0
+        var lastError: String?
+        for item in targets {
+            do {
+                try FileManager.default.trashItem(at: item.url, resultingItemURL: nil)
+                trashed += 1
+            } catch {
+                lastError = error.localizedDescription
+            }
+        }
+        markedURLs = []
+        refresh()
+        selection = min(idx, max(0, visibleItems.count - 1))
+        anchorIndex = selection
+        if trashed == 0, let e = lastError {
+            status = "Trash failed: \(e)"
+        } else {
+            status = trashed == 1 ? "Moved “\(targets[0].name)” to Trash" : "Moved \(trashed) items to Trash"
         }
     }
 
     func renameSelected() {
+        if selectionCount > 1 { status = "Select a single item to rename"; return }
         guard let item = selectedItem else { return }
         guard let newName = Prompt.text(title: "Rename", message: "New name:", defaultValue: item.name),
               !newName.isEmpty, newName != item.name else { return }
@@ -401,8 +536,8 @@ final class DirectoryModel: ObservableObject {
     }
 
     func revealInFinder() {
-        let target = selectedItem?.url ?? url
-        NSWorkspace.shared.activateFileViewerSelecting([target])
+        let targets = selectedItems.map(\.url)
+        NSWorkspace.shared.activateFileViewerSelecting(targets.isEmpty ? [url] : targets)
         status = "Revealed in Finder"
     }
 
@@ -413,10 +548,11 @@ final class DirectoryModel: ObservableObject {
     }
 
     func copyPathToPasteboard() {
-        let target = selectedItem?.url.path ?? url.path
+        let targets = selectedItems
+        let text = targets.isEmpty ? url.path : targets.map { $0.url.path }.joined(separator: "\n")
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(target, forType: .string)
-        status = "Copied path"
+        NSPasteboard.general.setString(text, forType: .string)
+        status = targets.count > 1 ? "Copied \(targets.count) paths" : "Copied path"
     }
 
     // MARK: Clipboard (file copy / paste)
@@ -424,10 +560,13 @@ final class DirectoryModel: ObservableObject {
     /// Put the selected file on the general pasteboard as a file URL so it can be
     /// pasted into Finder, Solo, or dropped into other apps.
     func copySelectedToClipboard() {
-        guard let item = selectedItem else { return }
+        let targets = selectedItems
+        guard !targets.isEmpty else { return }
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.writeObjects([item.url as NSURL])
-        status = "Copied “\(item.name)” — ⌘V to paste"
+        NSPasteboard.general.writeObjects(targets.map { $0.url as NSURL })
+        status = targets.count == 1
+            ? "Copied “\(targets[0].name)” — ⌘V to paste"
+            : "Copied \(targets.count) items — ⌘V to paste"
     }
 
     /// Copy any file URLs on the pasteboard into the current directory.
@@ -538,7 +677,9 @@ final class DirectoryModel: ObservableObject {
             let dirs = items.filter(\.isDir).count
             s = "\(total) items · \(dirs) folders · \(total - dirs) files"
         }
-        if let sel = selectedItem {
+        if selectionCount > 1 {
+            s += "    ·    \(selectionCount) selected"
+        } else if let sel = selectedItem {
             s += "    ·    \(sel.name)"
         }
         status = s
