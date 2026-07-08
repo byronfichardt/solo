@@ -51,7 +51,36 @@ final class DirectoryModel: ObservableObject {
 
     init(start: URL) {
         self.url = start
+        // Restore the view preferences the user last left the app in.
+        let d = UserDefaults.standard
+        if let raw = d.string(forKey: Defaults.sortKey), let k = SortKey(rawValue: raw) { sortKey = k }
+        if d.object(forKey: Defaults.sortAsc) != nil { sortAsc = d.bool(forKey: Defaults.sortAsc) }
+        showHidden = d.bool(forKey: Defaults.showHidden)
         load()
+    }
+
+    // MARK: Persistence
+
+    private enum Defaults {
+        static let sortKey = "sortKey"
+        static let sortAsc = "sortAsc"
+        static let showHidden = "showHidden"
+        static let lastDir = "lastDir"
+    }
+
+    /// The folder Solo should reopen at next launch (nil when none saved yet).
+    static var lastDirectory: URL? {
+        UserDefaults.standard.string(forKey: Defaults.lastDir).map { URL(fileURLWithPath: $0) }
+    }
+
+    /// Persist the current view preferences so the next launch matches this session.
+    private func savePreferences() {
+        let d = UserDefaults.standard
+        d.set(sortKey.rawValue, forKey: Defaults.sortKey)
+        d.set(sortAsc, forKey: Defaults.sortAsc)
+        d.set(showHidden, forKey: Defaults.showHidden)
+        // Don't persist the synthetic Recents location — reopen at a real folder.
+        if !isRecents { d.set(url.path, forKey: Defaults.lastDir) }
     }
 
     // MARK: Derived
@@ -237,8 +266,9 @@ final class DirectoryModel: ObservableObject {
     }
 
     /// Jump from a Recents entry to the folder that contains it, cursor on the file.
-    func openEnclosingFolder() {
-        guard let item = selectedItem else { return }
+    /// Acts on the passed item so a right-click inside a multi-selection opens the
+    /// folder of the row that was clicked, not whatever the cursor happens to be on.
+    func openEnclosingFolder(_ item: FileItem) {
         let name = item.name
         navigate(to: item.url.deletingLastPathComponent())
         if let idx = visibleItems.firstIndex(where: { $0.name == name }) { selection = idx }
@@ -262,6 +292,7 @@ final class DirectoryModel: ObservableObject {
         filter = ""; filtering = false
         load()
         restoreSelection(preferName: remember.map { _ in nil } ?? lastSelectedName[url])
+        savePreferences()
     }
 
     private func restoreSelection(preferName: String?) {
@@ -427,7 +458,9 @@ final class DirectoryModel: ObservableObject {
         if let n = keepName, let idx = visibleItems.firstIndex(where: { $0.name == n }) {
             selection = idx
         }
+        anchorIndex = selection   // keep ⇧-arrow anchored to where the cursor landed
         status = showHidden ? "Showing hidden files" : "Hiding hidden files"
+        savePreferences()
     }
 
     func cycleSort() {
@@ -458,6 +491,7 @@ final class DirectoryModel: ObservableObject {
         }
         // Marks are URL-keyed so they survive the reorder; the index anchor doesn't.
         anchorIndex = selection
+        savePreferences()
     }
 
     func refresh() {
@@ -466,6 +500,7 @@ final class DirectoryModel: ObservableObject {
         if let n = keepName, let idx = visibleItems.firstIndex(where: { $0.name == n }) {
             selection = idx
         }
+        anchorIndex = selection   // keep ⇧-arrow anchored to where the cursor landed
         status = "Refreshed"
     }
 
@@ -485,11 +520,12 @@ final class DirectoryModel: ObservableObject {
         guard !targets.isEmpty else { return }
         let idx = selection
         var trashed = 0
+        var trashedName: String?
         var lastError: String?
         for item in targets {
             do {
                 try FileManager.default.trashItem(at: item.url, resultingItemURL: nil)
-                trashed += 1
+                trashed += 1; trashedName = item.name
             } catch {
                 lastError = error.localizedDescription
             }
@@ -501,7 +537,7 @@ final class DirectoryModel: ObservableObject {
         if trashed == 0, let e = lastError {
             status = "Trash failed: \(e)"
         } else {
-            status = trashed == 1 ? "Moved “\(targets[0].name)” to Trash" : "Moved \(trashed) items to Trash"
+            status = trashed == 1 ? "Moved “\(trashedName ?? "")” to Trash" : "Moved \(trashed) items to Trash"
         }
     }
 

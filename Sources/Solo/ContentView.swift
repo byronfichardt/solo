@@ -1,6 +1,44 @@
 import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
+import Quartz
+
+/// Drives the shared `QLPreviewPanel` (Finder's spacebar Quick Look) for the
+/// current selection. We assign ourselves as the panel's data source directly
+/// rather than routing through the responder chain, which is the reliable path
+/// from a pure-SwiftUI app.
+@MainActor
+final class QuickLookController: NSObject, ObservableObject, @preconcurrency QLPreviewPanelDataSource, QLPreviewPanelDelegate {
+    private var urls: [URL] = []
+
+    /// Toggle the panel: show it for `items`, or hide it if already visible.
+    func toggle(items: [URL]) {
+        guard let panel = QLPreviewPanel.shared() else { return }
+        if panel.isVisible {
+            panel.orderOut(nil)
+            return
+        }
+        guard !items.isEmpty else { return }
+        urls = items
+        panel.dataSource = self
+        panel.delegate = self
+        panel.reloadData()
+        panel.makeKeyAndOrderFront(nil)
+    }
+
+    /// Keep the open panel in sync as the cursor moves; no-op when it's hidden.
+    func update(items: [URL]) {
+        guard let panel = QLPreviewPanel.shared(), panel.isVisible, !items.isEmpty else { return }
+        urls = items
+        panel.reloadData()
+    }
+
+    func numberOfPreviewItems(in panel: QLPreviewPanel!) -> Int { urls.count }
+
+    func previewPanel(_ panel: QLPreviewPanel!, previewItemAt index: Int) -> QLPreviewItem! {
+        urls.indices.contains(index) ? urls[index] as NSURL : nil
+    }
+}
 
 struct ContentView: View {
     @StateObject var model: DirectoryModel
@@ -9,6 +47,7 @@ struct ContentView: View {
     @State private var showHelp = false
     @State private var dropTargetIndex: Int?
     @State private var listDropTargeted = false
+    @StateObject private var quickLook = QuickLookController()
 
     private let pageSize = 15
 
@@ -36,10 +75,17 @@ struct ContentView: View {
             ScrollView {
                 LazyVStack(spacing: 0) {
                     if model.visibleItems.isEmpty {
-                        Text(model.filter.isEmpty ? "Empty folder" : "No matches")
-                            .foregroundStyle(.secondary)
-                            .frame(maxWidth: .infinity, alignment: .center)
-                            .padding(.top, 40)
+                        VStack(spacing: 6) {
+                            Text(model.filter.isEmpty ? "Empty folder" : "No matches")
+                                .foregroundStyle(.secondary)
+                            if model.filter.isEmpty {
+                                Text("type to filter · Space to preview · ⌘/ for shortcuts")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(.tertiary)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .center)
+                        .padding(.top, 40)
                     }
                     ForEach(Array(model.visibleItems.enumerated()), id: \.element.id) { idx, item in
                         let isSel = model.isSelected(idx)
@@ -86,6 +132,7 @@ struct ContentView: View {
             .onChange(of: model.selection) { _, _ in
                 guard let id = model.selectedItem?.id else { return }
                 proxy.scrollTo(id)
+                quickLook.update(items: model.selectedItems.map(\.url))
             }
             .onChange(of: model.url) { _, _ in
                 proxy.scrollTo(model.selectedItem?.id)
@@ -116,7 +163,7 @@ struct ContentView: View {
             model.contextSelect(idx); model.openSelected()
         }
         if model.isRecents {
-            Button("Open Enclosing Folder") { model.contextSelect(idx); model.openEnclosingFolder() }
+            Button("Open Enclosing Folder") { model.openEnclosingFolder(item) }
         }
         Divider()
         Button("Copy\(suffix)") { model.contextSelect(idx); model.copySelectedToClipboard() }
@@ -158,6 +205,12 @@ struct ContentView: View {
         }
         if p.modifiers.contains(.command) {
             return handleCommand(p)
+        }
+        // Space = Quick Look (Finder convention). Takes precedence over type-to-filter;
+        // use the search field (⌘F) when a literal space in the filter is needed.
+        if p.characters == " ", p.modifiers.isDisjoint(with: [.command, .control, .option]) {
+            quickLook.toggle(items: model.selectedItems.map(\.url))
+            return .handled
         }
         let shift = p.modifiers.contains(.shift)
         switch p.key {
@@ -471,6 +524,7 @@ struct HelpOverlay: View {
         ("⌘-click", "Add / remove from selection"),
         ("⇧-click", "Select range"),
         ("⌘A", "Select all"),
+        ("Space", "Quick Look preview"),
         ("→ / Return", "Open file or enter folder"),
         ("← / Backspace", "Go up to parent folder"),
         ("type letters", "Incremental filter (Esc to clear)"),

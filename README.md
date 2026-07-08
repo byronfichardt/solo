@@ -9,6 +9,7 @@ keyboard navigation.
 ## Features
 
 - **Single pane** directory listing with Name / Size / Modified columns
+- **Quick Look** — press `Space` to preview the selected file (Finder-style)
 - **Type-to-filter** — just start typing to incrementally filter the current folder (Esc clears)
 - **Full keyboard navigation** — arrows, Home/End, PageUp/Down, back/forward history
 - **Real system icons** via `NSWorkspace`
@@ -26,6 +27,7 @@ Press **⌘/** in the app for the full cheat sheet.
 | Key | Action |
 |-----|--------|
 | `↑` / `↓` | Move cursor |
+| `Space` | Quick Look preview |
 | `→` / `Return` | Open file or enter folder |
 | `←` / `Backspace` | Go up to parent |
 | type letters | Incremental filter (`Esc` to clear) |
@@ -78,3 +80,6 @@ To install, drag `Solo.app` into `/Applications`.
 - The app is ad-hoc signed locally so it launches without a developer account. If macOS
   Gatekeeper objects after copying it elsewhere, right-click → Open the first time.
 - File operations use the system Trash (recoverable) — nothing is hard-deleted.
+- Sort order, the hidden-files toggle, window size, and the last folder are remembered
+  across launches (via `UserDefaults`). Pass a folder on the command line to override
+  the remembered start folder.
