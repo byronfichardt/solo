@@ -1,6 +1,47 @@
 import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
+import Quartz
+
+/// Drives the shared `QLPreviewPanel` (Finder's spacebar Quick Look) for the
+/// current selection. We assign ourselves as the panel's data source directly
+/// rather than routing through the responder chain, which is the reliable path
+/// from a pure-SwiftUI app.
+@MainActor
+final class QuickLookController: NSObject, ObservableObject, @preconcurrency QLPreviewPanelDataSource, QLPreviewPanelDelegate {
+    private var urls: [URL] = []
+
+    /// Toggle the panel: show it for `items`, or hide it if already visible.
+    func toggle(items: [URL]) {
+        guard let panel = QLPreviewPanel.shared() else { return }
+        if panel.isVisible {
+            panel.orderOut(nil)
+            return
+        }
+        guard !items.isEmpty else { return }
+        urls = items
+        panel.dataSource = self
+        panel.delegate = self
+        panel.reloadData()
+        panel.makeKeyAndOrderFront(nil)
+    }
+
+    /// Keep the open panel in sync as the selection changes; no-op when it's hidden.
+    /// An empty selection (e.g. the previewed file was trashed) closes the panel
+    /// rather than leaving it showing a file that no longer exists.
+    func update(items: [URL]) {
+        guard let panel = QLPreviewPanel.shared(), panel.isVisible else { return }
+        if items.isEmpty { panel.orderOut(nil); return }
+        urls = items
+        panel.reloadData()
+    }
+
+    func numberOfPreviewItems(in panel: QLPreviewPanel!) -> Int { urls.count }
+
+    func previewPanel(_ panel: QLPreviewPanel!, previewItemAt index: Int) -> QLPreviewItem! {
+        urls.indices.contains(index) ? urls[index] as NSURL : nil
+    }
+}
 
 struct ContentView: View {
     @StateObject var model: DirectoryModel
@@ -9,6 +50,7 @@ struct ContentView: View {
     @State private var showHelp = false
     @State private var dropTargetIndex: Int?
     @State private var listDropTargeted = false
+    @StateObject private var quickLook = QuickLookController()
 
     private let pageSize = 15
 
@@ -36,25 +78,40 @@ struct ContentView: View {
             ScrollView {
                 LazyVStack(spacing: 0) {
                     if model.visibleItems.isEmpty {
-                        Text(model.filter.isEmpty ? "Empty folder" : "No matches")
-                            .foregroundStyle(.secondary)
-                            .frame(maxWidth: .infinity, alignment: .center)
-                            .padding(.top, 40)
+                        VStack(spacing: 6) {
+                            Text(model.filter.isEmpty ? "Empty folder" : "No matches")
+                                .foregroundStyle(.secondary)
+                            if model.filter.isEmpty {
+                                Text("type to filter · Space to preview · ⌘/ for shortcuts")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(.tertiary)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .center)
+                        .padding(.top, 40)
                     }
                     ForEach(Array(model.visibleItems.enumerated()), id: \.element.id) { idx, item in
-                        FileRow(item: item, selected: idx == model.selection && focused,
-                                softSelected: idx == model.selection && !focused,
+                        let isSel = model.isSelected(idx)
+                        FileRow(item: item, selected: isSel && focused,
+                                softSelected: isSel && !focused,
+                                isCursor: idx == model.selection && focused && model.selectionCount > 1,
                                 dropTargeted: item.isDir && dropTargetIndex == idx)
                             .contentShape(Rectangle())
                             // Select on the first click immediately; double-click opens.
                             // simultaneousGesture avoids the tap-disambiguation delay that
                             // makes single-click selection feel laggy.
+                            // ⌘ toggles a row, ⇧ extends a range — read live modifier flags
+                            // since SwiftUI's tap gesture doesn't surface them.
                             .onTapGesture {
-                                model.selection = idx; focused = true
+                                let mods = NSEvent.modifierFlags
+                                if mods.contains(.command) { model.toggleMark(idx) }
+                                else if mods.contains(.shift) { model.extendTo(idx) }
+                                else { model.selectSingle(idx) }
+                                focused = true
                             }
                             .simultaneousGesture(
                                 TapGesture(count: 2).onEnded {
-                                    model.selection = idx; model.openSelected()
+                                    model.selectSingle(idx); model.openSelected()
                                 }
                             )
                             // Drag a file out (to another folder, Finder, or Claude).
@@ -78,9 +135,18 @@ struct ContentView: View {
             .onChange(of: model.selection) { _, _ in
                 guard let id = model.selectedItem?.id else { return }
                 proxy.scrollTo(id)
+                quickLook.update(items: model.selectedItems.map(\.url))
             }
             .onChange(of: model.url) { _, _ in
                 proxy.scrollTo(model.selectedItem?.id)
+                // Refresh an open Quick Look panel too — entering a folder that lands
+                // on the same row index won't fire the selection onChange above.
+                quickLook.update(items: model.selectedItems.map(\.url))
+            }
+            // Marked-set changes (⌘A, ⌘-click) don't move the cursor index, so sync
+            // an open Quick Look panel off markedURLs as well.
+            .onChange(of: model.markedURLs) { _, _ in
+                quickLook.update(items: model.selectedItems.map(\.url))
             }
             // Drop onto empty pane area → into the current directory.
             .onDrop(of: [.fileURL], isTargeted: $listDropTargeted) { providers in
@@ -100,19 +166,26 @@ struct ContentView: View {
 
     @ViewBuilder
     private func rowMenu(idx: Int, item: FileItem) -> some View {
-        Button(item.isDir ? "Open Folder" : "Open") { model.selection = idx; model.openSelected() }
+        // How many items the action will hit: the whole selection when right-clicking
+        // inside it, otherwise just this row (contextSelect collapses to it first).
+        let count = (!model.markedURLs.isEmpty && model.markedURLs.contains(item.url)) ? model.selectionCount : 1
+        let suffix = count > 1 ? " \(count) Items" : ""
+        Button(count > 1 ? "Open\(suffix)" : (item.isDir ? "Open Folder" : "Open")) {
+            model.contextSelect(idx); model.openSelected()
+        }
         if model.isRecents {
-            Button("Open Enclosing Folder") { model.selection = idx; model.openEnclosingFolder() }
+            Button("Open Enclosing Folder") { model.openEnclosingFolder(item) }
         }
         Divider()
-        Button("Copy") { model.selection = idx; model.copySelectedToClipboard() }
+        Button("Copy\(suffix)") { model.contextSelect(idx); model.copySelectedToClipboard() }
         Button("Paste") { model.pasteIntoCurrent() }
-        Button("Copy Path") { model.selection = idx; model.copyPathToPasteboard() }
+        Button(count > 1 ? "Copy\(suffix) Paths" : "Copy Path") { model.contextSelect(idx); model.copyPathToPasteboard() }
         Divider()
-        Button("Rename…") { model.selection = idx; model.renameSelected() }
-        Button("Move to Trash") { model.selection = idx; model.trashSelected() }
+        Button("Rename…") { model.contextSelect(idx); model.renameSelected() }
+            .disabled(count > 1)
+        Button(count > 1 ? "Move\(suffix) to Trash" : "Move to Trash") { model.contextSelect(idx); model.trashSelected() }
         Divider()
-        Button("Reveal in Finder") { model.selection = idx; model.revealInFinder() }
+        Button("Reveal in Finder") { model.contextSelect(idx); model.revealInFinder() }
         Button("New Folder…") { model.newFolder() }
     }
 
@@ -144,15 +217,23 @@ struct ContentView: View {
         if p.modifiers.contains(.command) {
             return handleCommand(p)
         }
+        // Space = Quick Look (Finder convention) — but only when not mid-filter, so a
+        // literal space can still narrow a type-to-filter search (e.g. "annual report").
+        if p.characters == " ", model.filter.isEmpty,
+           p.modifiers.isDisjoint(with: [.command, .control, .option]) {
+            quickLook.toggle(items: model.selectedItems.map(\.url))
+            return .handled
+        }
+        let shift = p.modifiers.contains(.shift)
         switch p.key {
-        case .downArrow: model.moveSelection(by: 1); return .handled
-        case .upArrow:   model.moveSelection(by: -1); return .handled
+        case .downArrow: shift ? model.extendSelection(by: 1) : model.moveSelection(by: 1); return .handled
+        case .upArrow:   shift ? model.extendSelection(by: -1) : model.moveSelection(by: -1); return .handled
         case .rightArrow, .return: model.openSelected(); return .handled
         case .leftArrow: model.goUp(); return .handled
         case .home: model.selectFirst(); return .handled
         case .end:  model.selectLast(); return .handled
-        case .pageDown: model.moveSelection(by: pageSize); return .handled
-        case .pageUp:   model.moveSelection(by: -pageSize); return .handled
+        case .pageDown: shift ? model.extendSelection(by: pageSize) : model.moveSelection(by: pageSize); return .handled
+        case .pageUp:   shift ? model.extendSelection(by: -pageSize) : model.moveSelection(by: -pageSize); return .handled
         case .escape:
             if model.filtering { model.clearFilter(); return .handled }
             return .ignored
@@ -189,6 +270,7 @@ struct ContentView: View {
         }
         let option = p.modifiers.contains(.option)
         switch p.key.character {
+        case "a": model.selectAll()
         case "r": model.refresh()
         case "n": model.newFolder()
         case ".": model.toggleHidden()
@@ -348,6 +430,9 @@ struct FileRow: View {
     let item: FileItem
     let selected: Bool
     let softSelected: Bool
+    /// The keyboard cursor row while more than one item is selected — drawn with a
+    /// focus ring so you can see where arrow keys will move within the selection.
+    var isCursor: Bool = false
     var dropTargeted: Bool = false
     @State private var hovering = false
 
@@ -379,6 +464,10 @@ struct FileRow: View {
             if dropTargeted {
                 RoundedRectangle(cornerRadius: 5)
                     .strokeBorder(Color.accentColor, lineWidth: 2)
+            } else if isCursor {
+                RoundedRectangle(cornerRadius: 4)
+                    .strokeBorder(Color.white.opacity(0.9), lineWidth: 1.5)
+                    .padding(1)
             }
         }
         .onHover { hovering = $0 }
@@ -443,6 +532,11 @@ struct HelpOverlay: View {
 
     private let rows: [(String, String)] = [
         ("↑ / ↓", "Move cursor"),
+        ("⇧↑ / ⇧↓", "Extend selection"),
+        ("⌘-click", "Add / remove from selection"),
+        ("⇧-click", "Select range"),
+        ("⌘A", "Select all"),
+        ("Space", "Quick Look preview"),
         ("→ / Return", "Open file or enter folder"),
         ("← / Backspace", "Go up to parent folder"),
         ("type letters", "Incremental filter (Esc to clear)"),

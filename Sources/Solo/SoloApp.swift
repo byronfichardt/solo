@@ -1,17 +1,28 @@
 import SwiftUI
 import AppKit
 
-/// Resolve the starting directory: argv[1] if it's a directory, otherwise home.
+/// Resolve the starting directory: argv[1] if it's a directory, otherwise the
+/// folder Solo was last left in, otherwise home.
+@MainActor
 func resolveStartDirectory() -> URL {
+    let fm = FileManager.default
+    func existingDir(_ url: URL) -> URL? {
+        var isDir: ObjCBool = false
+        return fm.fileExists(atPath: url.path, isDirectory: &isDir) && isDir.boolValue
+            ? url.standardizedFileURL : nil
+    }
+    // An explicit path argument wins; if it's invalid, fall to home (a predictable
+    // default) rather than silently reopening the last folder and masking the typo.
     let args = CommandLine.arguments
     if args.count > 1 {
-        let candidate = URL(fileURLWithPath: (args[1] as NSString).expandingTildeInPath)
-        var isDir: ObjCBool = false
-        if FileManager.default.fileExists(atPath: candidate.path, isDirectory: &isDir), isDir.boolValue {
-            return candidate.standardizedFileURL
-        }
+        return existingDir(URL(fileURLWithPath: (args[1] as NSString).expandingTildeInPath))
+            ?? fm.homeDirectoryForCurrentUser
     }
-    return FileManager.default.homeDirectoryForCurrentUser
+    // No argument: reopen wherever Solo was last left.
+    if let last = DirectoryModel.lastDirectory, let dir = existingDir(last) {
+        return dir
+    }
+    return fm.homeDirectoryForCurrentUser
 }
 
 @MainActor

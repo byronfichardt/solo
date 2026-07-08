@@ -1,6 +1,32 @@
 import Foundation
 import AppKit
 
+/// Resolves and caches file icons on the main actor.
+///
+/// `NSWorkspace.icon(forFile:)` is not free, and Solo previously called it from
+/// `FileItem.icon` — a computed property — which meant every SwiftUI redraw of a
+/// row (hover, selection, scroll) refetched the icon and mutated the size of the
+/// OS's *shared* icon instance. Caching by path resolves each icon once and never
+/// touches shared state, so scrolling large folders stays smooth.
+@MainActor
+enum IconCache {
+    private static var cache: [String: NSImage] = [:]
+
+    static func icon(for url: URL) -> NSImage {
+        let path = url.path
+        if let cached = cache[path] { return cached }
+        let img = NSWorkspace.shared.icon(forFile: path)
+        cache[path] = img
+        return img
+    }
+
+    /// Drop cached icons. Called when a directory is (re)loaded so a file replaced
+    /// at the same path picks up its new icon, and the cache can't grow unbounded
+    /// across a long session. The scroll-jank fix is per-render caching within a
+    /// listing, which this preserves — icons simply refetch once per folder visit.
+    static func clear() { cache.removeAll(keepingCapacity: true) }
+}
+
 /// One entry in a directory listing.
 struct FileItem: Identifiable, Hashable {
     let url: URL
@@ -37,12 +63,9 @@ struct FileItem: Identifiable, Hashable {
         self.created = v?.creationDate ?? (v?.contentModificationDate ?? .distantPast)
     }
 
-    /// Cached system icon for the file.
-    var icon: NSImage {
-        let img = NSWorkspace.shared.icon(forFile: url.path)
-        img.size = NSSize(width: 16, height: 16)
-        return img
-    }
+    /// System icon for the file, fetched through `IconCache` so it is resolved once
+    /// per path instead of on every SwiftUI render (see the cache for why).
+    @MainActor var icon: NSImage { IconCache.icon(for: url) }
 
     var sizeString: String {
         guard !isDir else { return "—" }
