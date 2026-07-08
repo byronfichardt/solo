@@ -26,9 +26,12 @@ final class QuickLookController: NSObject, ObservableObject, @preconcurrency QLP
         panel.makeKeyAndOrderFront(nil)
     }
 
-    /// Keep the open panel in sync as the cursor moves; no-op when it's hidden.
+    /// Keep the open panel in sync as the selection changes; no-op when it's hidden.
+    /// An empty selection (e.g. the previewed file was trashed) closes the panel
+    /// rather than leaving it showing a file that no longer exists.
     func update(items: [URL]) {
-        guard let panel = QLPreviewPanel.shared(), panel.isVisible, !items.isEmpty else { return }
+        guard let panel = QLPreviewPanel.shared(), panel.isVisible else { return }
+        if items.isEmpty { panel.orderOut(nil); return }
         urls = items
         panel.reloadData()
     }
@@ -136,6 +139,14 @@ struct ContentView: View {
             }
             .onChange(of: model.url) { _, _ in
                 proxy.scrollTo(model.selectedItem?.id)
+                // Refresh an open Quick Look panel too — entering a folder that lands
+                // on the same row index won't fire the selection onChange above.
+                quickLook.update(items: model.selectedItems.map(\.url))
+            }
+            // Marked-set changes (⌘A, ⌘-click) don't move the cursor index, so sync
+            // an open Quick Look panel off markedURLs as well.
+            .onChange(of: model.markedURLs) { _, _ in
+                quickLook.update(items: model.selectedItems.map(\.url))
             }
             // Drop onto empty pane area → into the current directory.
             .onDrop(of: [.fileURL], isTargeted: $listDropTargeted) { providers in
@@ -206,9 +217,10 @@ struct ContentView: View {
         if p.modifiers.contains(.command) {
             return handleCommand(p)
         }
-        // Space = Quick Look (Finder convention). Takes precedence over type-to-filter;
-        // use the search field (⌘F) when a literal space in the filter is needed.
-        if p.characters == " ", p.modifiers.isDisjoint(with: [.command, .control, .option]) {
+        // Space = Quick Look (Finder convention) — but only when not mid-filter, so a
+        // literal space can still narrow a type-to-filter search (e.g. "annual report").
+        if p.characters == " ", model.filter.isEmpty,
+           p.modifiers.isDisjoint(with: [.command, .control, .option]) {
             quickLook.toggle(items: model.selectedItems.map(\.url))
             return .handled
         }

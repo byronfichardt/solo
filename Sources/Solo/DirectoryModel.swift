@@ -135,6 +135,7 @@ final class DirectoryModel: ObservableObject {
     // MARK: Loading
 
     func load() {
+        IconCache.clear()   // pick up icon changes and bound the cache per folder visit
         if isRecents { loadRecents(); return }
         let fm = FileManager.default
         let keys: [URLResourceKey] = [

@@ -11,11 +11,14 @@ func resolveStartDirectory() -> URL {
         return fm.fileExists(atPath: url.path, isDirectory: &isDir) && isDir.boolValue
             ? url.standardizedFileURL : nil
     }
+    // An explicit path argument wins; if it's invalid, fall to home (a predictable
+    // default) rather than silently reopening the last folder and masking the typo.
     let args = CommandLine.arguments
-    if args.count > 1,
-       let dir = existingDir(URL(fileURLWithPath: (args[1] as NSString).expandingTildeInPath)) {
-        return dir
+    if args.count > 1 {
+        return existingDir(URL(fileURLWithPath: (args[1] as NSString).expandingTildeInPath))
+            ?? fm.homeDirectoryForCurrentUser
     }
+    // No argument: reopen wherever Solo was last left.
     if let last = DirectoryModel.lastDirectory, let dir = existingDir(last) {
         return dir
     }

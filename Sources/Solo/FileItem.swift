@@ -19,6 +19,12 @@ enum IconCache {
         cache[path] = img
         return img
     }
+
+    /// Drop cached icons. Called when a directory is (re)loaded so a file replaced
+    /// at the same path picks up its new icon, and the cache can't grow unbounded
+    /// across a long session. The scroll-jank fix is per-render caching within a
+    /// listing, which this preserves — icons simply refetch once per folder visit.
+    static func clear() { cache.removeAll(keepingCapacity: true) }
 }
 
 /// One entry in a directory listing.
